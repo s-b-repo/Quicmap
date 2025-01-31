@@ -1,10 +1,9 @@
 import asyncio
 import ssl
 from enum import Enum
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import HeadersReceived
 import argparse
@@ -14,6 +13,17 @@ from colorama import Fore, Style, init
 
 # Initialize colorama
 init(autoreset=True)
+
+def parse_ports(ports_arg: str) -> List[int]:
+    """Parse port range argument"""
+    ports = []
+    for part in ports_arg.split(','):
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            ports.extend(range(start, end + 1))
+        else:
+            ports.append(int(part))
+    return sorted(set(ports))  # Remove duplicates and sort
 
 class ScanResult:
     def __init__(self, port: int):
@@ -52,24 +62,26 @@ async def fetch_http3_banner(quic_connection, timeout: float) -> Dict:
             headers=[
                 (b":method", b"HEAD"),
                 (b":scheme", b"https"),
-                (b":authority", b"example.com"),
+                (b":authority", quic_connection._server_name.encode()),
                 (b":path", b"/"),
                 (b"user-agent", b"QUIC-Scanner/1.0"),
             ],
         )
         quic_connection.send_stream_data(stream_id, b"", end_stream=True)
 
-        # Wait for response
-        start_time = asyncio.get_event_loop().time()
-        while True:
+        # Wait for response with proper timeout handling
+        try:
             event = await asyncio.wait_for(quic_connection.next_event(), timeout=timeout)
-            if isinstance(event, HeadersReceived):
-                return {
-                    "service": Protocol.HTTP3.value,
-                    "headers": {k.decode(): v.decode() for (k, v) in event.headers}
-                }
-            if (asyncio.get_event_loop().time() - start_time) > timeout:
-                raise asyncio.TimeoutError()
+            while not isinstance(event, HeadersReceived):
+                event = await asyncio.wait_for(quic_connection.next_event(), timeout=timeout)
+            
+            return {
+                "service": Protocol.HTTP3.value,
+                "headers": {k.decode(): v.decode() for (k, v) in event.headers}
+            }
+        except asyncio.TimeoutError:
+            raise TimeoutError("No response received within timeout period")
+
     except Exception as e:
         raise
 
@@ -77,7 +89,7 @@ async def check_quic_port(host: str, port: int, server_name: str, timeout: float
     result = ScanResult(port)
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
-    configuration.idle_timeout = timeout
+    configuration.idle_timeout = timeout + 2  # Add buffer for handshake
 
     try:
         async with connect(
@@ -85,11 +97,11 @@ async def check_quic_port(host: str, port: int, server_name: str, timeout: float
             port=port,
             configuration=configuration,
             server_name=server_name,
+            local_port=0,
         ) as connection:
             result.status = "open"
             result.protocol = connection._quic.alpn_protocol or "unknown"
 
-            # Detect HTTP/3 service
             if connection._quic.alpn_protocol in H3_ALPN:
                 try:
                     http_info = await asyncio.wait_for(
@@ -99,19 +111,20 @@ async def check_quic_port(host: str, port: int, server_name: str, timeout: float
                     result.service = http_info["service"]
                     headers = http_info["headers"]
                     result.version = headers.get("server", "Unknown")
-                    if "server" in headers:
-                        result.banner = f"{headers['server']} ({result.protocol})"
+                    result.banner = f"{headers.get('server', 'Unknown')} ({result.protocol})"
                 except Exception as e:
-                    result.error = f"HTTP3 detection failed: {str(e)}"
+                    result.error = f"HTTP/3 detection failed: {str(e)}"
             else:
                 result.service = Protocol.QUIC.value
                 result.banner = f"QUIC service ({result.protocol})"
 
     except Exception as e:
         result.error = str(e)
-        result.status = "error"
+        result.status = "error" if "handshake" in str(e).lower() else "closed"
 
     return result
+
+# Rest of the code remains the same as original (scan_ports, print_results, save_results, main)
 
 async def scan_ports(host: str, ports: list, server_name: str, timeout: float) -> list:
     tasks = [check_quic_port(host, port, server_name, timeout) for port in ports]
@@ -132,6 +145,8 @@ def print_results(results: list[ScanResult], verbose: bool = False):
                 print(f"{Fore.YELLOW}  Error: {result.error}")
         elif result.status == "error" and verbose:
             print(f"{Fore.RED}Port {result.port}: Error - {result.error}")
+        elif result.status == "closed" and verbose:
+            print(f"{Fore.LIGHTBLACK_EX}Port {result.port}: Closed")
 
 def save_results(results: list[ScanResult], format: str = "json", filename: str = None):
     if not filename:
@@ -168,14 +183,18 @@ if __name__ == "__main__":
                        help="Show verbose output")
 
     args = parser.parse_args()
-    ports = parse_ports(args.ports)  # Reuse previous parse_ports function
+    ports = parse_ports(args.ports)
 
     print(f"{Fore.CYAN}Scanning {args.host} (QUIC) on {len(ports)} ports...{Style.RESET_ALL}")
     
     loop = asyncio.new_event_loop()
-    results = loop.run_until_complete(
-        scan_ports(args.host, ports, args.server_name or args.host, args.timeout)
-    )
+    asyncio.set_event_loop(loop)
+    try:
+        results = loop.run_until_complete(
+            scan_ports(args.host, ports, args.server_name or args.host, args.timeout)
+        )
+    finally:
+        loop.close()
 
     print_results(results, args.verbose)
     
