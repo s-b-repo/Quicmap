@@ -5,7 +5,7 @@ from typing import Optional, Dict, List
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.h3.connection import H3_ALPN, H3Connection
-from aioquic.h3.events import HeadersReceived
+from aioquic.h3.events import HeadersReceived, DataReceived, H3Event
 import argparse
 import json
 from datetime import datetime
@@ -55,12 +55,12 @@ async def fetch_http3_banner(quic_connection, timeout: float) -> Dict:
     try:
         h3_connection = H3Connection(quic_connection)
         stream_id = quic_connection.get_next_available_stream_id()
-        
-        # Send a HEAD request to get headers
+
+        # Send a GET request to retrieve headers
         h3_connection.send_headers(
             stream_id=stream_id,
             headers=[
-                (b":method", b"HEAD"),
+                (b":method", b"GET"),
                 (b":scheme", b"https"),
                 (b":authority", quic_connection._server_name.encode()),
                 (b":path", b"/"),
@@ -69,18 +69,38 @@ async def fetch_http3_banner(quic_connection, timeout: float) -> Dict:
         )
         quic_connection.send_stream_data(stream_id, b"", end_stream=True)
 
-        # Wait for response with proper timeout handling
-        try:
-            event = await asyncio.wait_for(quic_connection.next_event(), timeout=timeout)
-            while not isinstance(event, HeadersReceived):
-                event = await asyncio.wait_for(quic_connection.next_event(), timeout=timeout)
+        headers_received = None
+        end_stream = False
+        start_time = asyncio.get_event_loop().time()
+
+        while not end_stream:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            remaining = max(0.0, timeout - elapsed)
+            if remaining <= 0:
+                raise TimeoutError("Timeout while waiting for response")
+
+            # Retrieve QUIC event
+            quic_event = await asyncio.wait_for(quic_connection.next_event(), timeout=remaining)
             
-            return {
-                "service": Protocol.HTTP3.value,
-                "headers": {k.decode(): v.decode() for (k, v) in event.headers}
-            }
-        except asyncio.TimeoutError:
-            raise TimeoutError("No response received within timeout period")
+            # Process QUIC event through H3Connection to get HTTP/3 events
+            h3_events = h3_connection.handle_event(quic_event)
+            for h3_event in h3_events:
+                if isinstance(h3_event, HeadersReceived) and h3_event.stream_id == stream_id:
+                    headers_received = h3_event.headers
+                    end_stream = h3_event.stream_ended
+                elif isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
+                    end_stream = h3_event.stream_ended
+
+        if headers_received is None:
+            raise TimeoutError("No headers received from the server")
+
+        headers_dict = {k.decode(): v.decode() for (k, v) in headers_received}
+        server_header = headers_dict.get('server', 'Unknown')
+        return {
+            "service": Protocol.HTTP3.value,
+            "headers": headers_dict,
+            "version": server_header
+        }
 
     except Exception as e:
         raise
@@ -89,7 +109,7 @@ async def check_quic_port(host: str, port: int, server_name: str, timeout: float
     result = ScanResult(port)
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.verify_mode = ssl.CERT_NONE
-    configuration.idle_timeout = timeout + 2  # Add buffer for handshake
+    configuration.idle_timeout = timeout + 2  # Slightly longer than timeout
 
     try:
         async with connect(
@@ -98,33 +118,40 @@ async def check_quic_port(host: str, port: int, server_name: str, timeout: float
             configuration=configuration,
             server_name=server_name,
             local_port=0,
+            wait_connected=timeout,
         ) as connection:
             result.status = "open"
             result.protocol = connection._quic.alpn_protocol or "unknown"
 
+            # Check if ALPN indicates HTTP/3
             if connection._quic.alpn_protocol in H3_ALPN:
                 try:
                     http_info = await asyncio.wait_for(
-                        fetch_http3_banner(connection, timeout/2),
-                        timeout=timeout/2
+                        fetch_http3_banner(connection, timeout),
+                        timeout=timeout
                     )
                     result.service = http_info["service"]
-                    headers = http_info["headers"]
-                    result.version = headers.get("server", "Unknown")
-                    result.banner = f"{headers.get('server', 'Unknown')} ({result.protocol})"
+                    result.version = http_info.get("version", "Unknown")
+                    result.banner = f"{result.version} ({result.protocol})"
                 except Exception as e:
                     result.error = f"HTTP/3 detection failed: {str(e)}"
             else:
                 result.service = Protocol.QUIC.value
                 result.banner = f"QUIC service ({result.protocol})"
 
-    except Exception as e:
+    except ConnectionRefusedError:
+        result.status = "closed"
+    except asyncio.TimeoutError:
+        result.status = "closed"
+        result.error = "Connection timeout"
+    except OSError as e:
+        result.status = "closed" if e.errno == 113 else "error"
         result.error = str(e)
-        result.status = "error" if "handshake" in str(e).lower() else "closed"
+    except Exception as e:
+        result.status = "error"
+        result.error = str(e)
 
     return result
-
-# Rest of the code remains the same as original (scan_ports, print_results, save_results, main)
 
 async def scan_ports(host: str, ports: list, server_name: str, timeout: float) -> list:
     tasks = [check_quic_port(host, port, server_name, timeout) for port in ports]
@@ -151,9 +178,9 @@ def print_results(results: list[ScanResult], verbose: bool = False):
 def save_results(results: list[ScanResult], format: str = "json", filename: str = None):
     if not filename:
         filename = f"quic_scan_{datetime.now().strftime('%Y%m%d%H%M%S')}.{format}"
-    
+
     data = [result.to_dict() for result in results]
-    
+
     if format == "json":
         with open(filename, "w") as f:
             json.dump(data, f, indent=2)
@@ -171,11 +198,11 @@ if __name__ == "__main__":
     parser.add_argument("host", help="Target hostname or IP address")
     parser.add_argument("-p", "--ports", default="1-1000",
                        help="Port range (e.g., 80,443 or 1-1000)")
-    parser.add_argument("-s", "--server-name", 
+    parser.add_argument("-s", "--server-name",
                        help="Server name indication (SNI) for TLS handshake")
     parser.add_argument("-t", "--timeout", type=float, default=3.0,
-                       help="Connection timeout per port")
-    parser.add_argument("-o", "--output", 
+                       help="Connection timeout per port (seconds)")
+    parser.add_argument("-o", "--output",
                        help="Output file name (supports .json or .txt)")
     parser.add_argument("-f", "--format", choices=["json", "txt"], default="json",
                        help="Output file format")
@@ -186,17 +213,20 @@ if __name__ == "__main__":
     ports = parse_ports(args.ports)
 
     print(f"{Fore.CYAN}Scanning {args.host} (QUIC) on {len(ports)} ports...{Style.RESET_ALL}")
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         results = loop.run_until_complete(
             scan_ports(args.host, ports, args.server_name or args.host, args.timeout)
         )
+    except KeyboardInterrupt:
+        print(f"{Fore.RED}Scan interrupted by user.")
+        results = []
     finally:
         loop.close()
 
     print_results(results, args.verbose)
-    
+
     if args.output:
         save_results(results, args.format, args.output)
