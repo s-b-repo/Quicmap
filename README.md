@@ -13,13 +13,13 @@ a quic port scanner
 
 Usage:
 # Basic scan with color output
-python quic_scanner.py example.com -p 443,8443 -s example.com
+python qmap.py example.com -p 443,8443 -s example.com
 
 # Full scan with verbose output and JSON export
-python quic_scanner.py example.com -p 1-65535 -t 5 -v -o results.json
+python qmap.py example.com -p 1-65535 -t 5 -v -o results.json
 
 # Quick scan with text output
-python quic_scanner.py 192.168.1.1 -p 80-443 -f txt -o scan_results.txt
+python qmap.py 192.168.1.1 -p 80-443 -f txt -o scan_results.txt
 
 # Dependencies:
 
