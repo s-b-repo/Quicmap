@@ -3,18 +3,25 @@ import ssl
 from enum import Enum
 from typing import Optional, Dict, List, Any
 from aioquic.asyncio import connect
+from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import HeadersReceived, DataReceived, H3Event
-from aioquic.quic.events import StreamDataReceived # For generic banner grabbing
+from aioquic.quic.events import StreamDataReceived, ProtocolNegotiated
 import argparse
 import json
+import logging
 from datetime import datetime
 from colorama import Fore, Style, init
 import os # For os.strerror
 
 # Initialize colorama
 init(autoreset=True)
+
+# aioquic logs benign "ConnectionError exception in shielded future" messages via
+# the asyncio event loop for every closed/unreachable port. Silence them so a
+# multi-port scan's output stays readable (the ScanResult already records status).
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 def parse_ports(ports_arg: str) -> List[int]:
     """Parse port range argument"""
@@ -67,156 +74,124 @@ class Protocol(Enum):
     HTTP3 = "HTTP/3"
     QUIC = "QUIC"
 
-async def fetch_http3_banner(
-    quic_connection: Any, # Actually aioquic.asyncio.QuicConnection
-    timeout: float
-) -> Dict[str, Any]:
-    """Attempt to retrieve HTTP/3 server headers."""
-    h3_connection = H3Connection(quic_connection.quic) # Use the core QUIC connection
-    stream_id = quic_connection.get_next_available_stream_id()
+MAX_BANNER_LEN = 256
 
-    authority = quic_connection.configuration.server_name
-    if not authority:
-        raise ValueError("Server name (authority) not available in QUIC configuration for HTTP/3 request.")
 
-    headers_to_send = [
-        (b":method", b"GET"),
-        (b":scheme", b"https"),
-        (b":authority", authority.encode()),
-        (b":path", b"/"),
-        (b"user-agent", b"QUIC-Scanner/1.2"), # Updated version
-    ]
+def _decode_banner(raw: bytes) -> Optional[str]:
+    """Decode collected bytes into a trimmed, length-capped banner string."""
+    if not raw:
+        return None
+    decoded = bytes(raw).decode("utf-8", errors="replace").strip()
+    if len(decoded) > MAX_BANNER_LEN:
+        decoded = decoded[:MAX_BANNER_LEN].strip() + "..."
+    return decoded or None
 
-    h3_connection.send_headers(stream_id=stream_id, headers=headers_to_send)
-    quic_connection.send_stream_data(stream_id, b"", end_stream=True)
 
-    received_headers_list: Optional[List[tuple[bytes, bytes]]] = None # Renamed for clarity
-    stream_ended_flags = {"headers": False, "data": False}
-    
-    loop = asyncio.get_running_loop()
-    start_time = loop.time()
+class ScannerProtocol(QuicConnectionProtocol):
+    """QuicConnectionProtocol subclass for aioquic >= 1.x.
 
-    try:
-        while not (stream_ended_flags["headers"] and stream_ended_flags["data"]):
-            elapsed_time = loop.time() - start_time
-            remaining_time = timeout - elapsed_time
-            if remaining_time <= 0:
-                raise asyncio.TimeoutError("Timeout while waiting for HTTP/3 response events.")
+    aioquic no longer yields a raw QuicConnection from connect() that can be
+    polled with next_event(); instead it delivers events to this callback. We
+    capture the negotiated ALPN, and route events either to an H3Connection
+    (for an HTTP/3 banner) or to a raw per-stream buffer (generic QUIC banner).
+    """
 
-            quic_event = await asyncio.wait_for(quic_connection.next_event(), timeout=remaining_time)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpn: Optional[str] = None
+        self._h3: Optional[H3Connection] = None
+        self._h3_headers: Dict[int, List[tuple]] = {}
+        self._h3_data: Dict[int, bytearray] = {}
+        self._h3_done: Dict[int, asyncio.Future] = {}
+        self._raw_buf: Dict[int, bytearray] = {}
+        self._raw_done: Dict[int, asyncio.Future] = {}
 
-            if quic_event is None:
-                if not received_headers_list:
-                    raise ConnectionAbortedError("QUIC connection closed before any H3 headers were received.")
-                break 
+    def quic_event_received(self, event) -> None:
+        if isinstance(event, ProtocolNegotiated):
+            self.alpn = event.alpn_protocol
 
-            for h3_event in h3_connection.handle_event(quic_event):
-                if h3_event.stream_id == stream_id:
-                    if isinstance(h3_event, HeadersReceived):
-                        received_headers_list = h3_event.headers
-                        stream_ended_flags["headers"] = True 
-                        if h3_event.stream_ended:
-                           stream_ended_flags["data"] = True 
-                    elif isinstance(h3_event, DataReceived):
-                        if h3_event.stream_ended:
-                            stream_ended_flags["data"] = True
-                    
-                    if received_headers_list and stream_ended_flags["headers"] and stream_ended_flags["data"]:
-                        break 
-            
-            if received_headers_list and stream_ended_flags["headers"] and stream_ended_flags["data"]:
-                break 
+        # HTTP/3 path: feed every event to the H3 state machine once active.
+        if self._h3 is not None:
+            for h3_event in self._h3.handle_event(event):
+                sid = getattr(h3_event, "stream_id", None)
+                if isinstance(h3_event, HeadersReceived):
+                    self._h3_headers[sid] = h3_event.headers
+                    if h3_event.stream_ended:
+                        self._resolve(self._h3_done, sid)
+                elif isinstance(h3_event, DataReceived):
+                    self._h3_data.setdefault(sid, bytearray()).extend(h3_event.data)
+                    if h3_event.stream_ended:
+                        self._resolve(self._h3_done, sid)
 
-        if received_headers_list is None:
+        # Generic raw-stream path.
+        if isinstance(event, StreamDataReceived) and event.stream_id in self._raw_done:
+            sid = event.stream_id
+            self._raw_buf.setdefault(sid, bytearray()).extend(event.data)
+            if event.end_stream:
+                self._resolve(self._raw_done, sid)
+
+    @staticmethod
+    def _resolve(waiters: Dict[int, asyncio.Future], sid: int) -> None:
+        fut = waiters.get(sid)
+        if fut is not None and not fut.done():
+            fut.set_result(True)
+
+    async def fetch_http3_banner(self, authority: str, timeout: float) -> Dict[str, Any]:
+        """Send an HTTP/3 GET / and return the response headers."""
+        if not authority:
+            raise ValueError("Server name (authority) not available for HTTP/3 request.")
+        self._h3 = H3Connection(self._quic)
+        stream_id = self._quic.get_next_available_stream_id()
+        fut = self._loop.create_future()
+        self._h3_done[stream_id] = fut
+        headers_to_send = [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", authority.encode()),
+            (b":path", b"/"),
+            (b"user-agent", b"QUIC-Scanner/1.3"),
+        ]
+        self._h3.send_headers(stream_id=stream_id, headers=headers_to_send, end_stream=True)
+        self.transmit()
+
+        await asyncio.wait_for(fut, timeout=timeout)
+
+        received = self._h3_headers.get(stream_id)
+        if not received:
             raise EOFError("No HTTP/3 headers received from the server for the stream.")
-
-        headers_dict = {k.decode(errors='replace'): v.decode(errors='replace') for (k, v) in received_headers_list}
-        server_header = headers_dict.get('server', None)
-
+        headers_dict = {k.decode(errors="replace"): v.decode(errors="replace") for (k, v) in received}
+        server_header = headers_dict.get("server")
         return {
             "service": Protocol.HTTP3.value,
             "headers": headers_dict,
             "version": server_header if server_header else "UnknownServer",
         }
-    except Exception as e:
-        raise 
 
-async def fetch_generic_quic_banner(
-    quic_connection: Any, # aioquic.asyncio.QuicConnection
-    timeout: float
-) -> Dict[str, Any]:
-    """Attempt to retrieve a generic banner from a QUIC service by sending a probe."""
-    stream_id = quic_connection.get_next_available_stream_id()
-    
-    # Common probe that might elicit a response from various services.
-    # Other options: b"\r\n", b"VERSION\r\n", b"STATUS\r\n"
-    probe_data = b"GET / HTTP/1.0\r\n\r\n" 
+    async def fetch_generic_quic_banner(self, timeout: float) -> Dict[str, Any]:
+        """Send a generic probe on a QUIC stream and collect any response bytes."""
+        stream_id = self._quic.get_next_available_stream_id()
+        fut = self._loop.create_future()
+        self._raw_done[stream_id] = fut
+        probe_data = b"GET / HTTP/1.0\r\n\r\n"
+        try:
+            self._quic.send_stream_data(stream_id, probe_data, end_stream=True)
+            self.transmit()
+        except Exception as e:
+            return {"banner": None, "error": f"Failed to send probe: {e}"}
 
-    try:
-        quic_connection.send_stream_data(stream_id, probe_data, end_stream=True)
-    except Exception as e: # Handle potential errors during send, e.g., if connection is closing
-        return {"banner": None, "error": f"Failed to send probe: {e}"}
+        note = None
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            if not self._raw_buf.get(stream_id):
+                return {"banner": None, "error": "Timeout waiting for banner"}
+            note = "Partial data due to timeout"
 
-
-    banner_bytes = bytearray()
-    stream_ended_flag = False # Renamed for clarity
-    
-    loop = asyncio.get_running_loop()
-    start_time = loop.time()
-    decoded_banner = None # Initialize
-
-    try:
-        while not stream_ended_flag:
-            elapsed_time = loop.time() - start_time
-            remaining_time = timeout - elapsed_time
-            if remaining_time <= 0:
-                # If we got some data before timeout, use it. Otherwise, raise timeout.
-                if banner_bytes:
-                    break 
-                raise asyncio.TimeoutError("Timeout while waiting for generic QUIC banner data.")
-
-            event = await asyncio.wait_for(quic_connection.next_event(), timeout=remaining_time)
-
-            if event is None: # Connection closed
-                break 
-            
-            if isinstance(event, StreamDataReceived) and event.stream_id == stream_id:
-                banner_bytes.extend(event.data)
-                if event.end_stream:
-                    stream_ended_flag = True
-            # Could also handle StreamReset if needed
-            # elif isinstance(event, StreamReset) and event.stream_id == stream_id:
-            #    stream_ended_flag = True
-            #    # Optionally log stream reset as an error/note for the banner
-        
-        if banner_bytes:
-            try:
-                # Try decoding as UTF-8, replace errors. ASCII is a subset of UTF-8.
-                decoded_banner = banner_bytes.decode('utf-8', errors='replace')
-                # Limit banner length for display/storage
-                max_banner_len = 256 # Increased slightly
-                if len(decoded_banner) > max_banner_len:
-                    decoded_banner = decoded_banner[:max_banner_len].strip() + "..."
-                else:
-                    decoded_banner = decoded_banner.strip() # Remove leading/trailing whitespace
-            except Exception: # Broad catch for any decoding issue
-                decoded_banner = f"[Binary data, {len(banner_bytes)} bytes]"
-        
-        return {"banner": decoded_banner if decoded_banner else None}
-
-    except asyncio.TimeoutError:
-        if banner_bytes: # Partial data received before timeout
-            try:
-                decoded_banner = banner_bytes.decode('utf-8', errors='replace').strip()
-                max_banner_len = 256
-                if len(decoded_banner) > max_banner_len:
-                    decoded_banner = decoded_banner[:max_banner_len].strip() + "..."
-                return {"banner": decoded_banner, "note": "Partial data due to timeout"}
-            except Exception:
-                 return {"banner": f"[Partial binary data, {len(banner_bytes)} bytes]", "note": "Partial data due to timeout"}
-        return {"banner": None, "error": "Timeout waiting for banner"} # No data at all
-    except Exception as e:
-        return {"banner": None, "error": f"Error during banner grab: {type(e).__name__} - {str(e)}"}
+        banner = _decode_banner(self._raw_buf.get(stream_id, bytearray()))
+        result = {"banner": banner}
+        if note:
+            result["note"] = note
+        return result
 
 
 async def check_quic_port(host: str, port: int, server_name_to_use: str, timeout: float) -> ScanResult:
@@ -225,32 +200,35 @@ async def check_quic_port(host: str, port: int, server_name_to_use: str, timeout
         is_client=True,
         alpn_protocols=H3_ALPN 
     )
-    configuration.verify_mode = ssl.CERT_NONE 
+    configuration.verify_mode = ssl.CERT_NONE
     configuration.idle_timeout = int(timeout + 10) # Increased QUIC idle timeout
+    # SNI / server name is set on the configuration in aioquic >= 1.x
+    # (it is no longer a keyword argument to connect()).
+    configuration.server_name = server_name_to_use
 
     try:
-        async with connect(
+        async with asyncio.timeout(timeout), connect(
             host=host,
             port=port,
             configuration=configuration,
-            server_name=server_name_to_use, 
-            local_port=0, 
-            wait_connected=True, 
-            timeout=timeout 
-        ) as connection: 
+            create_protocol=ScannerProtocol,
+            local_port=0,
+            wait_connected=True,
+        ) as connection:
             result.status = "open"
-            result.protocol = connection.alpn_protocol or "QUIC (no ALPN)"
+            alpn = connection.alpn
+            result.protocol = alpn or "QUIC (no ALPN)"
 
-            if connection.alpn_protocol in H3_ALPN:
+            if alpn in H3_ALPN:
                 result.service = Protocol.HTTP3.value
                 try:
                     http_info = await asyncio.wait_for(
-                        fetch_http3_banner(connection, timeout),
+                        connection.fetch_http3_banner(server_name_to_use, timeout),
                         timeout=timeout
                     )
                     result.version = http_info.get("version", "Unknown")
                     # For H3, banner is typically the server software from headers
-                    result.banner = f"Server: {result.version}" 
+                    result.banner = f"Server: {result.version}"
                     result.full_headers = http_info.get("headers")
                 except Exception as e:
                     result.error = (result.error + "; " if result.error else "") + \
@@ -261,10 +239,10 @@ async def check_quic_port(host: str, port: int, server_name_to_use: str, timeout
                 result.service = Protocol.QUIC.value
                 try:
                     generic_banner_info = await asyncio.wait_for(
-                        fetch_generic_quic_banner(connection, timeout),
-                        timeout=timeout 
+                        connection.fetch_generic_quic_banner(timeout),
+                        timeout=timeout
                     )
-                    
+
                     if generic_banner_info.get("banner"):
                         result.banner = generic_banner_info["banner"]
                     else:
@@ -292,8 +270,12 @@ async def check_quic_port(host: str, port: int, server_name_to_use: str, timeout
         result.status = "closed"
         result.error = "Connection refused"
     except asyncio.TimeoutError:
-        result.status = "closed" 
-        result.error = "Connection timeout"
+        if result.status == "open":
+            # Handshake succeeded; the timeout hit during banner grabbing.
+            result.error = (result.error + "; " if result.error else "") + "Timed out during banner grab"
+        else:
+            result.status = "closed"
+            result.error = "Connection timeout"
     except OSError as e:
         if e.errno in [111, 113, 61]: # ECONNREFUSED, EHOSTUNREACH, also 61 for macos conn refused
             result.status = "closed"
